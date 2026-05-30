@@ -1,11 +1,5 @@
 package dev.javadebugger.cli;
 
-import dev.javadebugger.core.BreakpointSpec;
-import dev.javadebugger.core.DebuggerSession;
-import dev.javadebugger.core.DebuggerStop;
-import dev.javadebugger.core.LaunchConfig;
-import dev.javadebugger.core.StepDirection;
-
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -20,6 +14,12 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.stream.Stream;
+
+import dev.javadebugger.core.BreakpointSpec;
+import dev.javadebugger.core.DebuggerSession;
+import dev.javadebugger.core.DebuggerStop;
+import dev.javadebugger.core.LaunchConfig;
+import dev.javadebugger.core.StepDirection;
 
 public final class Main {
     private static final Duration WAIT_FOR_STOP_TIMEOUT = Duration.ofMinutes(5);
