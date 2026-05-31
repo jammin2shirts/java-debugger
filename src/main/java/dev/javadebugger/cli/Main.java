@@ -13,9 +13,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Scanner;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import dev.javadebugger.core.BreakpointSpec;
+import dev.javadebugger.core.DebugSourceFile;
 import dev.javadebugger.core.DebuggerSession;
 import dev.javadebugger.core.DebuggerStop;
 import dev.javadebugger.core.LaunchConfig;
@@ -24,29 +26,66 @@ import dev.javadebugger.core.StepDirection;
 public final class Main {
     private static final Duration WAIT_FOR_STOP_TIMEOUT = Duration.ofMinutes(5);
     private static final BreakpointPersistence BREAKPOINT_PERSISTENCE = BreakpointPersistence.defaultStore();
+    private static volatile List<Path> configuredSourceRoots = List.of();
+    private static volatile boolean attachMode = false;
 
     private Main() {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length == 0 || isHelp(args[0])) {
+        if (args.length > 0 && isHelp(args[0])) {
             printUsage();
             return;
         }
 
-        if (!"launch".equals(args[0])) {
-            System.err.println("Unknown command: " + args[0]);
-            printUsage();
-            return;
+        SessionPlan sessionPlan;
+        if (args.length > 0 && "launch".equals(args[0])) {
+            configuredSourceRoots = List.of();
+            attachMode = false;
+            LaunchConfig config = parseLaunchConfig(Arrays.copyOfRange(args, 1, args.length));
+            sessionPlan = new SessionPlan(
+                    session -> session.start(config),
+                    true,
+                    "Connected (launch mode). Target is suspended at startup.");
+        } else if (args.length > 0 && "attach".equals(args[0])) {
+            AttachConfig config = parseAttachConfig(Arrays.copyOfRange(args, 1, args.length));
+            List<Path> attachSourceRoots = config.sourceRoots().isEmpty()
+                ? defaultAttachSourceRoots()
+                : config.sourceRoots();
+            configuredSourceRoots = normalizeSourceRoots(attachSourceRoots);
+            attachMode = true;
+            sessionPlan = new SessionPlan(
+                    session -> session.attach(config.host(), config.port()),
+                    false,
+                attachStartupMessage(config.host(), config.port(), configuredSourceRoots));
+            } else if (containsToken(args, "--launch")) {
+                configuredSourceRoots = List.of();
+                attachMode = false;
+                LaunchConfig config = parseLaunchConfig(removeToken(args, "--launch"));
+                sessionPlan = new SessionPlan(
+                    session -> session.start(config),
+                    true,
+                    "Connected (launch mode). Target is suspended at startup.");
+        } else {
+                // Default mode: attach to localhost:5005 unless attach options override it.
+                AttachConfig config = parseAttachConfig(args);
+                List<Path> attachSourceRoots = config.sourceRoots().isEmpty()
+                    ? defaultAttachSourceRoots()
+                    : config.sourceRoots();
+                configuredSourceRoots = normalizeSourceRoots(attachSourceRoots);
+                attachMode = true;
+                sessionPlan = new SessionPlan(
+                    session -> session.attach(config.host(), config.port()),
+                    false,
+                    attachStartupMessage(config.host(), config.port(), configuredSourceRoots));
         }
 
-        LaunchConfig config = parseLaunchConfig(Arrays.copyOfRange(args, 1, args.length));
         List<BreakpointSpec> breakpointsForRestart = BREAKPOINT_PERSISTENCE.load();
 
         while (true) {
-            try (DebuggerSession session = new DebuggerSession(stop -> {
-            })) {
-                session.start(config);
+            AtomicReference<DebuggerStop> asyncStopRef = new AtomicReference<>();
+            try (DebuggerSession session = new DebuggerSession(asyncStopRef::set)) {
+                sessionPlan.start(session);
                 for (BreakpointSpec breakpoint : breakpointsForRestart) {
                     BreakpointSpec restored = session.addBreakpoint(breakpoint.sourcePath(), breakpoint.line());
                     if (!breakpoint.enabled()) {
@@ -54,11 +93,20 @@ public final class Main {
                     }
                 }
 
-                String startupMessage = awaitNextStop(session, "start");
+                String startupMessage;
+                if (sessionPlan.waitForInitialStop() && !breakpointsForRestart.isEmpty()) {
+                    session.resumeExecution();
+                    startupMessage = "Auto-continued to first stop. " + awaitNextStop(session, "continue");
+                } else if (sessionPlan.waitForInitialStop()) {
+                    startupMessage = awaitNextStop(session, "start");
+                } else {
+                    startupMessage = sessionPlan.initialMessage();
+                }
                 if (!breakpointsForRestart.isEmpty()) {
                     startupMessage = startupMessage + " Restored breakpoints: " + summarizeBreakpoints(breakpointsForRestart, false);
                 }
-                ShellResult result = runShell(session, startupMessage);
+                asyncStopRef.set(null);
+                ShellResult result = runShell(session, startupMessage, asyncStopRef);
                 if (!result.restartRequested()) {
                     return;
                 }
@@ -71,7 +119,28 @@ public final class Main {
         return "-h".equals(value) || "--help".equals(value);
     }
 
-    private static ShellResult runShell(DebuggerSession session, String initialMessage) throws IOException {
+    private static boolean containsToken(String[] args, String token) {
+        for (String arg : args) {
+            if (token.equals(arg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String[] removeToken(String[] args, String token) {
+        List<String> filtered = new ArrayList<>();
+        for (String arg : args) {
+            if (!token.equals(arg)) {
+                filtered.add(arg);
+            }
+        }
+        return filtered.toArray(String[]::new);
+    }
+
+    private static ShellResult runShell(DebuggerSession session,
+                                        String initialMessage,
+                                        AtomicReference<DebuggerStop> asyncStopRef) throws IOException {
         Scanner scanner = new Scanner(System.in);
         String lastRepeatableCommand = null;
         String lastMessage = initialMessage;
@@ -79,10 +148,18 @@ public final class Main {
         while (true) {
             renderInterface(session, lastMessage);
             System.out.print("jdbg> ");
-            String rawInput = readPromptInput(scanner);
-            if (rawInput == null) {
+            PromptInput promptInput = readPromptInput(scanner, asyncStopRef);
+            if (promptInput.eof()) {
                 return new ShellResult(false, List.of());
             }
+            if (promptInput.asyncStop() != null) {
+                DebuggerStop stop = promptInput.asyncStop();
+                lastMessage = "Asynchronous stop detected. " + describeStop(stop);
+                lastRepeatableCommand = null;
+                continue;
+            }
+
+            String rawInput = promptInput.text();
             String line;
             if (rawInput.isEmpty()) {
                 if (lastRepeatableCommand == null) {
@@ -115,7 +192,7 @@ public final class Main {
                     }
                     session.resumeExecution();
                     lastRepeatableCommand = "continue";
-                    lastMessage = awaitNextStop(session, "continue");
+                    lastMessage = "Execution resumed. Waiting for next stop...";
                     if (isTerminated(session)) {
                         lastRepeatableCommand = null;
                     }
@@ -123,6 +200,11 @@ public final class Main {
                 case "step" -> {
                     if (isTerminated(session)) {
                         lastMessage = postTerminationMessage();
+                        lastRepeatableCommand = null;
+                        break;
+                    }
+                    if (session.currentStop().isEmpty()) {
+                        lastMessage = "Debugger is running and not paused yet. Wait for a breakpoint to be hit before stepping.";
                         lastRepeatableCommand = null;
                         break;
                     }
@@ -155,46 +237,52 @@ public final class Main {
         }
     }
 
-    private static String readPromptInput(Scanner scanner) throws IOException {
+    private static PromptInput readPromptInput(Scanner scanner,
+                                               AtomicReference<DebuggerStop> asyncStopRef) throws IOException {
         if (System.console() == null) {
             if (!scanner.hasNextLine()) {
-                return null;
+                return PromptInput.endOfInput();
             }
-            return scanner.nextLine().trim();
+            return PromptInput.ofText(scanner.nextLine().trim());
         }
 
         try (TerminalMode ignored = TerminalMode.enterRaw()) {
             StringBuilder buffer = new StringBuilder();
             while (true) {
-                int key = System.in.read();
+                DebuggerStop asyncStop = asyncStopRef.getAndSet(null);
+                if (asyncStop != null) {
+                    return PromptInput.ofAsyncStop(asyncStop);
+                }
+
+                int key = readByteWithTimeout(50);
                 if (key == -1) {
-                    return null;
+                    continue;
                 }
 
                 if (key == 27) {
                     NavKey navKey = readEscapedNavKey();
                     if (navKey == NavKey.UP) {
                         System.out.println();
-                        return "step into";
+                        return PromptInput.ofText("step into");
                     }
                     if (navKey == NavKey.DOWN) {
                         System.out.println();
-                        return "continue";
+                        return PromptInput.ofText("continue");
                     }
                     if (navKey == NavKey.RIGHT) {
                         System.out.println();
-                        return "step over";
+                        return PromptInput.ofText("step over");
                     }
                     if (navKey == NavKey.LEFT) {
                         System.out.println();
-                        return "step out";
+                        return PromptInput.ofText("step out");
                     }
                     continue;
                 }
 
                 if (key == '\n' || key == '\r') {
                     System.out.println();
-                    return buffer.toString().trim();
+                    return PromptInput.ofText(buffer.toString().trim());
                 }
 
                 if (key == 127 || key == 8) {
@@ -319,8 +407,12 @@ public final class Main {
             return "Usage: step into|over|out";
         }
 
-        session.step(direction);
-        return awaitNextStop(session, "step");
+        try {
+            session.step(direction);
+            return awaitNextStop(session, "step");
+        } catch (IllegalStateException exception) {
+            return "Debugger is not paused yet. Wait for the first stop before stepping.";
+        }
     }
 
     private static String printBreakpoints(DebuggerSession session) {
@@ -381,9 +473,9 @@ public final class Main {
     }
 
     private static String browseFilesAndToggleBreakpoints(DebuggerSession session) {
-        List<Path> files = listProjectSourceFiles();
+        List<FileEntry> files = listFileEntries(session);
         if (files.isEmpty()) {
-            return "No source files found under src/.";
+            return "No source files available from the target JVM or local src/.";
         }
 
         try (TerminalMode ignored = TerminalMode.enterRaw()) {
@@ -394,7 +486,7 @@ public final class Main {
                 System.out.println();
                 for (int i = 0; i < files.size(); i++) {
                     String marker = i == fileIndex ? ">" : " ";
-                    System.out.println(marker + " " + files.get(i));
+                    System.out.println(marker + " " + files.get(i).displayPath());
                 }
 
                 NavKey key = readNavKey();
@@ -417,23 +509,27 @@ public final class Main {
         }
     }
 
-    private static String editFileBreakpoints(DebuggerSession session, Path file) {
+    private static String editFileBreakpoints(DebuggerSession session, FileEntry file) {
+        if (file.localPath() == null || !Files.exists(file.localPath())) {
+            return editRemoteFileBreakpoints(session, file);
+        }
+
         List<String> lines;
         try {
-            lines = Files.readAllLines(file);
+            lines = Files.readAllLines(file.localPath());
         } catch (IOException exception) {
-            return "Unable to read file: " + file;
+            return "Unable to read file: " + file.displayPath();
         }
 
         if (lines.isEmpty()) {
-            return "File is empty: " + file;
+            return "File is empty: " + file.displayPath();
         }
 
         int cursor = 0;
         String lastAction = "Use space to toggle breakpoint on the highlighted line.";
         while (true) {
             clearScreen();
-            System.out.println("Line Picker: " + file);
+            System.out.println("Line Picker: " + file.displayPath());
             System.out.println("(up/down move, space toggle breakpoint, enter/q back)");
             System.out.println("Message: " + lastAction);
             System.out.println();
@@ -442,7 +538,7 @@ public final class Main {
             int end = Math.min(lines.size() - 1, cursor + 8);
             for (int i = start; i <= end; i++) {
                 int lineNumber = i + 1;
-                BreakpointSpec existing = findBreakpoint(session.breakpointList(), file, lineNumber);
+                BreakpointSpec existing = findBreakpoint(session.breakpointList(), file.sourcePath(), lineNumber);
                 String marker = i == cursor ? ">" : " ";
                 String bp = existing == null ? "   " : (existing.enabled() ? "[*]" : "[ ]");
                 System.out.printf("%s %s %4d | %s%n", marker, bp, lineNumber, lines.get(i));
@@ -454,9 +550,9 @@ public final class Main {
                 case DOWN -> cursor = Math.min(lines.size() - 1, cursor + 1);
                 case SPACE -> {
                     int lineNumber = cursor + 1;
-                    BreakpointSpec existing = findBreakpoint(session.breakpointList(), file, lineNumber);
+                    BreakpointSpec existing = findBreakpoint(session.breakpointList(), file.sourcePath(), lineNumber);
                     if (existing == null) {
-                        BreakpointSpec created = session.addBreakpoint(file.toString(), lineNumber);
+                        BreakpointSpec created = session.addBreakpoint(file.sourcePath(), file.classNameHint(), lineNumber);
                         lastAction = "Added breakpoint " + created.id() + " at line " + lineNumber;
                     } else {
                         session.removeBreakpoint(existing.id());
@@ -464,7 +560,56 @@ public final class Main {
                     }
                 }
                 case ENTER, QUIT -> {
-                    return "Updated breakpoints for " + file.getFileName();
+                    return "Updated breakpoints for " + file.displayPath();
+                }
+                default -> {
+                }
+            }
+        }
+    }
+
+    private static String editRemoteFileBreakpoints(DebuggerSession session, FileEntry file) {
+        List<Integer> executableLines = file.executableLines();
+        if (executableLines.isEmpty()) {
+            return "No executable line metadata available for " + file.displayPath() + ".";
+        }
+
+        int cursor = 0;
+        String lastAction = "Use space to toggle breakpoint on the highlighted executable line.";
+        while (true) {
+            clearScreen();
+            System.out.println("Line Picker: " + file.displayPath());
+            System.out.println("(target JVM metadata mode; up/down move, space toggle breakpoint, enter/q back)");
+            System.out.println("Message: " + lastAction);
+            System.out.println();
+
+            int start = Math.max(0, cursor - 8);
+            int end = Math.min(executableLines.size() - 1, cursor + 8);
+            for (int i = start; i <= end; i++) {
+                int lineNumber = executableLines.get(i);
+                BreakpointSpec existing = findBreakpoint(session.breakpointList(), file.sourcePath(), lineNumber);
+                String marker = i == cursor ? ">" : " ";
+                String bp = existing == null ? "   " : (existing.enabled() ? "[*]" : "[ ]");
+                System.out.printf("%s %s line %d%n", marker, bp, lineNumber);
+            }
+
+            NavKey key = readNavKey();
+            switch (key) {
+                case UP -> cursor = Math.max(0, cursor - 1);
+                case DOWN -> cursor = Math.min(executableLines.size() - 1, cursor + 1);
+                case SPACE -> {
+                    int lineNumber = executableLines.get(cursor);
+                    BreakpointSpec existing = findBreakpoint(session.breakpointList(), file.sourcePath(), lineNumber);
+                    if (existing == null) {
+                        BreakpointSpec created = session.addBreakpoint(file.sourcePath(), file.classNameHint(), lineNumber);
+                        lastAction = "Added breakpoint " + created.id() + " at line " + lineNumber;
+                    } else {
+                        session.removeBreakpoint(existing.id());
+                        lastAction = "Removed breakpoint " + existing.id() + " from line " + lineNumber;
+                    }
+                }
+                case ENTER, QUIT -> {
+                    return "Updated breakpoints for " + file.displayPath();
                 }
                 default -> {
                 }
@@ -557,7 +702,57 @@ public final class Main {
         return new String(output, StandardCharsets.UTF_8).trim();
     }
 
-    private static List<Path> listProjectSourceFiles() {
+    private static List<FileEntry> listFileEntries(DebuggerSession session) {
+        List<DebugSourceFile> targetFiles = session.listLoadedSourceFiles();
+        if (!targetFiles.isEmpty()) {
+            List<FileEntry> mappedTargetFiles = targetFiles.stream()
+                    .map(file -> new FileEntry(
+                    file.sourcePath(),
+                            file.sourcePath(),
+                            resolveSourcePathIfPresent(file.sourcePath()).orElse(null),
+                            file.className(),
+                            file.executableLines(),
+                            file.hasMainMethod()))
+                .toList();
+
+            List<FileEntry> projectFiles = mappedTargetFiles.stream()
+                .filter(file -> !isLikelyDependencyClass(file.classNameHint(), file.sourcePath()))
+                .map(file -> {
+                Path localPath = file.localPath();
+                String displayPath = localPath == null ? file.sourcePath() : toProjectDisplayPath(localPath);
+                        return new FileEntry(displayPath, file.sourcePath(), localPath, file.classNameHint(), file.executableLines(), file.hasMainMethod());
+                })
+                    .sorted(Comparator.comparing(FileEntry::displayPath))
+                    .toList();
+
+            String appPackage = detectMainApplicationPackage(projectFiles);
+            if (appPackage != null) {
+                List<FileEntry> packageScopedFiles = projectFiles.stream()
+                        .filter(file -> classBelongsToPackage(file.classNameHint(), appPackage))
+                        .toList();
+                if (!packageScopedFiles.isEmpty()) {
+                    return packageScopedFiles;
+                }
+            }
+
+            if (!projectFiles.isEmpty()) {
+            return projectFiles;
+            }
+
+            return mappedTargetFiles.stream()
+                .map(file -> {
+                Path localPath = file.localPath();
+                String displayPath = localPath == null ? file.sourcePath() : toProjectDisplayPath(localPath);
+                        return new FileEntry(displayPath, file.sourcePath(), localPath, file.classNameHint(), file.executableLines(), file.hasMainMethod());
+                })
+                .sorted(Comparator.comparing(FileEntry::displayPath))
+                .toList();
+        }
+
+        return listProjectSourceFiles();
+    }
+
+    private static List<FileEntry> listProjectSourceFiles() {
         Path root = Paths.get("src");
         if (!Files.exists(root)) {
             return List.of();
@@ -567,25 +762,114 @@ public final class Main {
             return walk
                     .filter(path -> Files.isRegularFile(path) && path.toString().endsWith(".java"))
                     .sorted(Comparator.comparing(Path::toString))
+                    .map(path -> new FileEntry(
+                            path.toString(),
+                            path.toString(),
+                            path,
+                            null,
+                            List.<Integer>of(),
+                            false))
                     .toList();
         } catch (IOException exception) {
             return List.of();
         }
     }
 
-    private static BreakpointSpec findBreakpoint(List<BreakpointSpec> breakpoints, Path file, int lineNumber) {
-        String normalizedTarget = file.toString().replace('\\', '/');
+    private static BreakpointSpec findBreakpoint(List<BreakpointSpec> breakpoints, String sourcePath, int lineNumber) {
+        String normalizedTarget = sourcePath.replace('\\', '/');
         for (BreakpointSpec breakpoint : breakpoints) {
             if (breakpoint.line() != lineNumber) {
                 continue;
             }
 
-            String sourcePath = breakpoint.sourcePath().replace('\\', '/');
-            if (sourcePath.equals(normalizedTarget) || normalizedTarget.endsWith(sourcePath) || sourcePath.endsWith(normalizedTarget)) {
+            String breakpointSourcePath = breakpoint.sourcePath().replace('\\', '/');
+            if (breakpointSourcePath.equals(normalizedTarget) || normalizedTarget.endsWith(breakpointSourcePath) || breakpointSourcePath.endsWith(normalizedTarget)) {
                 return breakpoint;
             }
         }
         return null;
+    }
+
+    private static Optional<Path> resolveSourcePathIfPresent(String sourcePath) {
+        if (sourcePath == null || sourcePath.isBlank()) {
+            return Optional.empty();
+        }
+
+        Path raw = Paths.get(sourcePath);
+        if (raw.isAbsolute() && Files.exists(raw)) {
+            return Optional.of(raw.normalize());
+        }
+
+        return resolveSourceFile(DebuggerStop.of("breakpoint", -1L, sourcePath, null, null, 1, "unknown", false));
+    }
+
+    private static String toProjectDisplayPath(Path path) {
+        Path normalized = path.toAbsolutePath().normalize();
+        Path cwd = Paths.get("").toAbsolutePath().normalize();
+        if (normalized.startsWith(cwd)) {
+            return cwd.relativize(normalized).toString();
+        }
+        return normalized.toString();
+    }
+
+    private static boolean isLikelyDependencyClass(String className, String sourcePath) {
+        String name = className == null ? "" : className;
+        String path = sourcePath == null ? "" : sourcePath;
+
+        return startsWithAny(name,
+                "java.",
+                "javax.",
+                "jdk.",
+                "sun.",
+                "com.sun.",
+                "org.w3c.",
+                "org.xml.",
+                "kotlin.",
+                "scala.",
+                "org.springframework.",
+                "org.apache.",
+                "org.hibernate.",
+                "org.slf4j.",
+                "ch.qos.logback.",
+                "com.fasterxml.",
+                "com.google.",
+                "jakarta.",
+                "io.netty.",
+                "reactor.",
+                "org.junit.")
+                || path.startsWith("META-INF/")
+                || path.startsWith("module-info");
+    }
+
+    private static boolean startsWithAny(String value, String... prefixes) {
+        for (String prefix : prefixes) {
+            if (value.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String detectMainApplicationPackage(List<FileEntry> files) {
+        for (FileEntry file : files) {
+            if (!file.hasMainMethod() || file.classNameHint() == null || file.classNameHint().isBlank()) {
+                continue;
+            }
+            int lastDot = file.classNameHint().lastIndexOf('.');
+            if (lastDot > 0) {
+                return file.classNameHint().substring(0, lastDot);
+            }
+        }
+        return null;
+    }
+
+    private static boolean classBelongsToPackage(String className, String packageName) {
+        if (className == null || className.isBlank()) {
+            return false;
+        }
+        return className.equals(packageName)
+                || className.startsWith(packageName + ".")
+                || className.startsWith(packageName + "$");
     }
 
     private static NavKey readNavKey() {
@@ -739,6 +1023,49 @@ public final class Main {
         return new LaunchConfig(mainClass, classpath, programArgs);
     }
 
+    private static AttachConfig parseAttachConfig(String[] args) {
+        String host = "127.0.0.1";
+        int port = 5005;
+        List<Path> sourceRoots = new ArrayList<>();
+
+        for (int i = 0; i < args.length; i++) {
+            String token = args[i];
+            switch (token) {
+                case "--host" -> {
+                    ensureHasValue(args, i, token);
+                    host = args[++i];
+                }
+                case "--port" -> {
+                    ensureHasValue(args, i, token);
+                    try {
+                        port = Integer.parseInt(args[++i]);
+                    } catch (NumberFormatException exception) {
+                        throw new IllegalArgumentException("Invalid attach port: " + args[i]);
+                    }
+                }
+                case "--source-root" -> {
+                    ensureHasValue(args, i, token);
+                    sourceRoots.add(Paths.get(args[++i]));
+                }
+                case "-h", "--help" -> {
+                    printUsage();
+                    System.exit(0);
+                }
+                default -> throw new IllegalArgumentException("Unknown attach option: " + token);
+            }
+        }
+
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("attach port must be in range 1-65535");
+        }
+
+        if (host == null || host.isBlank()) {
+            throw new IllegalArgumentException("attach host cannot be blank");
+        }
+
+        return new AttachConfig(host, port, sourceRoots);
+    }
+
     private static void ensureHasValue(String[] args, int index, String flag) {
         if (index + 1 >= args.length) {
             throw new IllegalArgumentException("Missing value for " + flag);
@@ -795,6 +1122,9 @@ public final class Main {
 
         Optional<Path> sourceFile = resolveSourceFile(stop);
         if (sourceFile.isEmpty()) {
+            String sourceLabel = stop.sourceName() != null ? stop.sourceName() : "<unknown source>";
+            System.out.println("Source: " + sourceLabel + ":" + stop.lineNumber());
+            System.out.println("-> Runtime is stopped at this mapped line. Local source text is unavailable.");
             return;
         }
 
@@ -802,10 +1132,32 @@ public final class Main {
         try {
             lines = Files.readAllLines(sourceFile.get());
         } catch (IOException exception) {
+            System.out.println("Source: " + sourceFile.get() + ":" + stop.lineNumber());
+            System.out.println("-> Runtime is stopped at this mapped line. Source text could not be read.");
             return;
         }
 
         int currentLine = stop.lineNumber();
+        if (lines.isEmpty()) {
+            System.out.println("Source: " + sourceFile.get() + ":" + currentLine);
+            System.out.println("-> Runtime is stopped at this mapped line. Source file is empty.");
+            return;
+        }
+
+        if (currentLine > lines.size()) {
+            int startLine = Math.max(1, lines.size() - 2);
+            int endLine = lines.size();
+            int gutterWidth = Integer.toString(currentLine).length();
+
+            System.out.println("Source: " + sourceFile.get() + ":" + currentLine);
+            for (int line = startLine; line <= endLine; line++) {
+                String lineText = lines.get(line - 1);
+                System.out.printf("   %" + gutterWidth + "d | %s%n", line, lineText);
+            }
+            System.out.printf("-> %" + gutterWidth + "d | <runtime mapped location (method epilogue/closing brace)>%n", currentLine);
+            return;
+        }
+
         int startLine = Math.max(1, currentLine - 2);
         int endLine = Math.min(lines.size(), currentLine + 2);
         int gutterWidth = Integer.toString(endLine).length();
@@ -823,17 +1175,28 @@ public final class Main {
             return Optional.empty();
         }
 
+        // In attach mode, do not probe arbitrary local paths. Use only explicit source roots.
+        if (attachMode && configuredSourceRoots.isEmpty()) {
+            return Optional.empty();
+        }
+
         Path raw = Paths.get(stop.sourcePath());
         if (raw.isAbsolute() && Files.exists(raw)) {
             return Optional.of(raw.normalize());
         }
 
         Path cwd = Paths.get("").toAbsolutePath().normalize();
-        List<Path> candidates = List.of(
-                cwd.resolve(stop.sourcePath()),
-                cwd.resolve("src/main/java").resolve(stop.sourcePath()),
-                cwd.resolve("src/test/java").resolve(stop.sourcePath())
-        );
+        List<Path> effectiveSourceRoots = new ArrayList<>(configuredSourceRoots);
+
+        List<Path> candidates = new ArrayList<>();
+        if (!attachMode) {
+            candidates.add(cwd.resolve(stop.sourcePath()));
+            candidates.add(cwd.resolve("src/main/java").resolve(stop.sourcePath()));
+            candidates.add(cwd.resolve("src/test/java").resolve(stop.sourcePath()));
+        }
+        for (Path sourceRoot : effectiveSourceRoots) {
+            candidates.add(sourceRoot.resolve(stop.sourcePath()));
+        }
 
         for (Path candidate : candidates) {
             if (Files.exists(candidate)) {
@@ -846,12 +1209,26 @@ public final class Main {
             return Optional.empty();
         }
 
-        Path srcDir = cwd.resolve("src");
-        if (!Files.exists(srcDir)) {
-            return Optional.empty();
+        if (!attachMode) {
+            List<Path> searchRoots = new ArrayList<>();
+            searchRoots.add(cwd.resolve("src"));
+            searchRoots.addAll(effectiveSourceRoots);
+            for (Path searchRoot : searchRoots) {
+                if (!Files.exists(searchRoot)) {
+                    continue;
+                }
+                Optional<Path> found = findFileByName(searchRoot, fileName);
+                if (found.isPresent()) {
+                    return found;
+                }
+            }
         }
 
-        try (Stream<Path> walk = Files.walk(srcDir)) {
+        return Optional.empty();
+    }
+
+    private static Optional<Path> findFileByName(Path searchRoot, String fileName) {
+        try (Stream<Path> walk = Files.walk(searchRoot)) {
             return walk
                     .filter(path -> Files.isRegularFile(path) && fileName.equals(path.getFileName().toString()))
                     .findFirst()
@@ -861,9 +1238,47 @@ public final class Main {
         }
     }
 
+    private static List<Path> normalizeSourceRoots(List<Path> sourceRoots) {
+        if (sourceRoots == null || sourceRoots.isEmpty()) {
+            return List.of();
+        }
+        return sourceRoots.stream()
+                .map(path -> path.toAbsolutePath().normalize())
+                .distinct()
+                .toList();
+    }
+
+    private static List<Path> defaultAttachSourceRoots() {
+        Path cwd = Paths.get("").toAbsolutePath().normalize();
+        List<Path> defaults = new ArrayList<>();
+        Path mainJava = cwd.resolve("src/main/java");
+        Path testJava = cwd.resolve("src/test/java");
+        if (Files.exists(mainJava)) {
+            defaults.add(mainJava);
+        }
+        if (Files.exists(testJava)) {
+            defaults.add(testJava);
+        }
+        return defaults;
+    }
+
+    private static String attachStartupMessage(String host, int port, List<Path> sourceRoots) {
+        if (sourceRoots.isEmpty()) {
+            return "Attached to " + host + ":" + port + ". Set breakpoints and wait for a stop.";
+        }
+        String roots = sourceRoots.stream()
+                .map(Path::toString)
+                .collect(java.util.stream.Collectors.joining(", "));
+        return "Attached to " + host + ":" + port + ". Using source roots: " + roots + ".";
+    }
+
     private static void printUsage() {
         System.out.println("Usage:");
+        System.out.println("  java -jar java-debugger.jar [--host <host>] [--port <port>] [--source-root <path> ...]");
+        System.out.println("    Defaults to attach mode at 127.0.0.1:5005");
+        System.out.println("  java -jar java-debugger.jar --launch --main-class <class> --classpath <paths> [--arg <value> ...]");
         System.out.println("  java -jar java-debugger.jar launch --main-class <class> --classpath <paths> [--arg <value> ...]");
+        System.out.println("  java -jar java-debugger.jar attach [--host <host>] [--port <port>] [--source-root <path> ...]");
     }
 
     private enum NavKey {
@@ -932,5 +1347,37 @@ public final class Main {
     }
 
     private record ShellResult(boolean restartRequested, List<BreakpointSpec> breakpoints) {
+    }
+
+    @FunctionalInterface
+    private interface SessionStarter {
+        void start(DebuggerSession session) throws Exception;
+    }
+
+    private record SessionPlan(SessionStarter starter, boolean waitForInitialStop, String initialMessage) {
+        private void start(DebuggerSession session) throws Exception {
+            starter.start(session);
+        }
+    }
+
+    private record AttachConfig(String host, int port, List<Path> sourceRoots) {
+    }
+
+    private record FileEntry(String displayPath, String sourcePath, Path localPath, String classNameHint,
+                             List<Integer> executableLines, boolean hasMainMethod) {
+    }
+
+    private record PromptInput(String text, DebuggerStop asyncStop, boolean eof) {
+        private static PromptInput ofText(String text) {
+            return new PromptInput(text, null, false);
+        }
+
+        private static PromptInput ofAsyncStop(DebuggerStop stop) {
+            return new PromptInput("", stop, false);
+        }
+
+        private static PromptInput endOfInput() {
+            return new PromptInput("", null, true);
+        }
     }
 }

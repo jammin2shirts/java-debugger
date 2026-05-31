@@ -4,10 +4,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -23,6 +27,7 @@ import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.connect.LaunchingConnector;
@@ -46,6 +51,7 @@ import com.sun.jdi.request.StepRequest;
 public final class DebuggerSession implements AutoCloseable {
     private static final String BREAKPOINT_ID = "breakpoint-id";
     private static final String AUTO_RESUME_STEP = "auto-resume-step";
+    private static final String STEP_DEPTH = "step-depth";
 
     private final AtomicLong breakpointIds = new AtomicLong(1);
     private final Map<Long, BreakpointSpec> breakpoints = new ConcurrentHashMap<>();
@@ -61,6 +67,7 @@ public final class DebuggerSession implements AutoCloseable {
     private volatile StepRequest currentStepRequest;
     private volatile DebuggerStop currentStop;
     private volatile Thread eventLoopThread;
+    private volatile boolean autoResumeOnVmStart;
 
     public DebuggerSession(Consumer<DebuggerStop> stopConsumer) {
         this.stopConsumer = stopConsumer == null ? stop -> {
@@ -71,6 +78,8 @@ public final class DebuggerSession implements AutoCloseable {
         if (vm != null) {
             throw new IllegalStateException("Session already started");
         }
+
+        autoResumeOnVmStart = false;
 
         LaunchingConnector connector = findLaunchingConnector();
         Map<String, Connector.Argument> arguments = connector.defaultArguments();
@@ -94,9 +103,47 @@ public final class DebuggerSession implements AutoCloseable {
         eventLoopThread.start();
     }
 
+    public synchronized void attach(String host, int port) throws IOException, IllegalConnectorArgumentsException {
+        if (vm != null) {
+            throw new IllegalStateException("Session already started");
+        }
+
+        autoResumeOnVmStart = true;
+
+        AttachingConnector connector = findAttachingConnector();
+        Map<String, Connector.Argument> arguments = connector.defaultArguments();
+
+        Connector.Argument hostArg = arguments.get("hostname");
+        if (hostArg != null) {
+            hostArg.setValue(host);
+        }
+
+        Connector.Argument portArg = arguments.get("port");
+        if (portArg == null) {
+            throw new IllegalStateException("SocketAttach connector does not expose a port argument");
+        }
+        portArg.setValue(Integer.toString(port));
+
+        vm = connector.attach(arguments);
+        EventRequestManager requestManager = vm.eventRequestManager();
+        ClassPrepareRequest classPrepareRequest = requestManager.createClassPrepareRequest();
+        classPrepareRequest.setSuspendPolicy(EventRequest.SUSPEND_NONE);
+        classPrepareRequest.enable();
+
+        eventLoopThread = new Thread(this::eventLoop, "jdbg-event-loop");
+        eventLoopThread.setDaemon(true);
+        eventLoopThread.start();
+    }
+
     public BreakpointSpec addBreakpoint(String sourcePath, int line) {
+        return addBreakpoint(sourcePath, null, line);
+    }
+
+    public BreakpointSpec addBreakpoint(String sourcePath, String classNameHint, int line) {
         String normalizedSource = normalizeSourcePath(sourcePath);
-        String className = inferClassName(normalizedSource);
+        String className = classNameHint == null || classNameHint.isBlank()
+                ? inferClassName(normalizedSource)
+                : classNameHint;
 
         BreakpointSpec existingBySourceLine = findBreakpointBySourceAndLine(normalizedSource, line);
         if (existingBySourceLine != null) {
@@ -135,6 +182,40 @@ public final class DebuggerSession implements AutoCloseable {
         }
 
         return spec;
+    }
+
+    public List<DebugSourceFile> listLoadedSourceFiles() {
+        VirtualMachine currentVm = vm;
+        if (currentVm == null || terminationLatch.getCount() == 0) {
+            return List.of();
+        }
+
+        Map<String, SourceAccumulator> bySource = new HashMap<>();
+        try {
+            for (ReferenceType referenceType : currentVm.allClasses()) {
+                String sourcePath = referenceTypeSourcePath(referenceType);
+                if (sourcePath == null || sourcePath.isBlank()) {
+                    continue;
+                }
+
+                SourceAccumulator accumulator = bySource.computeIfAbsent(sourcePath, ignored -> new SourceAccumulator());
+                if (accumulator.className == null || referenceType.name().length() < accumulator.className.length()) {
+                    accumulator.className = referenceType.name();
+                }
+                accumulator.executableLines.addAll(referenceTypeExecutableLines(referenceType));
+                accumulator.hasMainMethod = accumulator.hasMainMethod || referenceTypeHasMainMethod(referenceType);
+            }
+        } catch (VMDisconnectedException ignored) {
+            return List.of();
+        }
+
+        List<DebugSourceFile> result = new ArrayList<>();
+        for (Map.Entry<String, SourceAccumulator> entry : bySource.entrySet()) {
+            List<Integer> lines = new ArrayList<>(entry.getValue().executableLines);
+            result.add(new DebugSourceFile(entry.getKey(), entry.getValue().className, lines, entry.getValue().hasMainMethod));
+        }
+        result.sort(Comparator.comparing(DebugSourceFile::sourcePath));
+        return result;
     }
 
     public boolean removeBreakpoint(long breakpointId) {
@@ -241,11 +322,15 @@ public final class DebuggerSession implements AutoCloseable {
         clearPendingStops();
         if (currentStop != null && currentStop.breakpointId() >= 0) {
             resumePastCurrentBreakpoint(currentVm);
+            currentStop = null;
+            pausedThread = null;
             return;
         }
 
         clearStepRequest();
         reenableSuppressedBreakpoints();
+        currentStop = null;
+        pausedThread = null;
         currentVm.resume();
     }
 
@@ -270,6 +355,7 @@ public final class DebuggerSession implements AutoCloseable {
         request.addClassExclusionFilter("sun.*");
         request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
         request.putProperty(BREAKPOINT_ID, -1L);
+        request.putProperty(STEP_DEPTH, direction.depth());
         request.enable();
         currentStepRequest = request;
         currentVm.resume();
@@ -306,8 +392,7 @@ public final class DebuggerSession implements AutoCloseable {
 
                 for (Event event : eventSet) {
                     if (event instanceof VMStartEvent vmStartEvent) {
-                        handleVmStart(vmStartEvent);
-                        shouldResume = false;
+                        shouldResume = handleVmStart(vmStartEvent);
                     } else if (event instanceof ClassPrepareEvent classPrepareEvent) {
                         handleClassPrepare(classPrepareEvent);
                     } else if (event instanceof BreakpointEvent breakpointEvent) {
@@ -316,6 +401,10 @@ public final class DebuggerSession implements AutoCloseable {
                     } else if (event instanceof StepEvent stepEvent) {
                         Object autoResume = stepEvent.request().getProperty(AUTO_RESUME_STEP);
                         if (Boolean.TRUE.equals(autoResume)) {
+                            reenableSuppressedBreakpoints();
+                            shouldResume = true;
+                        } else if (isUserInvisibleStepLocation(stepEvent.location())
+                                && queueFollowUpStep(stepEvent.thread(), stepEvent.request().getProperty(STEP_DEPTH))) {
                             reenableSuppressedBreakpoints();
                             shouldResume = true;
                         } else {
@@ -353,7 +442,13 @@ public final class DebuggerSession implements AutoCloseable {
         }
     }
 
-    private void handleVmStart(VMStartEvent event) {
+    private boolean handleVmStart(VMStartEvent event) {
+        if (autoResumeOnVmStart) {
+            pausedThread = null;
+            currentStop = null;
+            return true;
+        }
+
         pausedThread = event.thread();
         DebuggerStop stop = DebuggerStop.of(
                 "start",
@@ -367,12 +462,14 @@ public final class DebuggerSession implements AutoCloseable {
         currentStop = stop;
             publishStop(stop);
         stopConsumer.accept(stop);
+        return false;
     }
 
     private void handleStop(String kind, Object requestBreakpointId, ThreadReference thread, Location location) {
         clearStepRequest();
         pausedThread = thread;
-        long breakpointId = requestBreakpointId instanceof Long value ? value : -1L;
+        Long breakpointIdValue = requestBreakpointId instanceof Long value ? value : null;
+        long breakpointId = breakpointIdValue == null ? -1L : breakpointIdValue.longValue();
         if (breakpointId >= 0) {
             suppressBreakpoint(breakpointId);
         }
@@ -530,6 +627,18 @@ public final class DebuggerSession implements AutoCloseable {
             return true;
         }
 
+        String normalizedSourcePath = normalizeSourcePath(spec.sourcePath());
+        try {
+            for (String candidatePath : referenceType.sourcePaths(null)) {
+                String normalizedCandidate = normalizeSourcePath(candidatePath);
+                if (normalizedCandidate.equals(normalizedSourcePath)
+                        || normalizedCandidate.endsWith("/" + PathUtils.fileName(normalizedSourcePath))) {
+                    return true;
+                }
+            }
+        } catch (AbsentInformationException ignored) {
+        }
+
         String sourceFileName = PathUtils.fileName(spec.sourcePath());
         try {
             for (String sourceName : referenceType.sourceNames(null)) {
@@ -551,6 +660,40 @@ public final class DebuggerSession implements AutoCloseable {
             } catch (RuntimeException ignored) {
             }
         }
+    }
+
+    private boolean queueFollowUpStep(ThreadReference thread, Object depthProperty) {
+        if (thread == null) {
+            return false;
+        }
+
+        Integer depthValue = depthProperty instanceof Integer value ? value : null;
+        int depth = depthValue == null ? StepRequest.STEP_OVER : depthValue.intValue();
+        clearStepRequest();
+        try {
+            StepRequest request = eventRequestManager().createStepRequest(thread, StepRequest.STEP_LINE, depth);
+            request.addCountFilter(1);
+            request.addClassExclusionFilter("java.*");
+            request.addClassExclusionFilter("javax.*");
+            request.addClassExclusionFilter("sun.*");
+            request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            request.putProperty(BREAKPOINT_ID, -1L);
+            request.putProperty(STEP_DEPTH, depth);
+            request.enable();
+            currentStepRequest = request;
+            return true;
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private boolean isUserInvisibleStepLocation(Location location) {
+        if (location == null || location.lineNumber() <= 0) {
+            return true;
+        }
+
+        String sourceName = safeSourceName(location);
+        return sourceName == null || sourceName.isBlank();
     }
 
     private void resumePastCurrentBreakpoint(VirtualMachine currentVm) {
@@ -622,6 +765,13 @@ public final class DebuggerSession implements AutoCloseable {
                 .orElseThrow(() -> new IllegalStateException("No command line launching connector available"));
     }
 
+    private AttachingConnector findAttachingConnector() {
+        return Bootstrap.virtualMachineManager().attachingConnectors().stream()
+                .filter(connector -> "com.sun.jdi.SocketAttach".equals(connector.name()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("No socket attaching connector available"));
+    }
+
     private String buildVmOptions(String classpath) {
         return "-cp " + classpath;
     }
@@ -669,6 +819,44 @@ public final class DebuggerSession implements AutoCloseable {
         }
     }
 
+    private String referenceTypeSourcePath(ReferenceType referenceType) {
+        try {
+            List<String> sourcePaths = referenceType.sourcePaths(null);
+            if (!sourcePaths.isEmpty()) {
+                return normalizeSourcePath(sourcePaths.get(0));
+            }
+        } catch (AbsentInformationException ignored) {
+        }
+
+        try {
+            String sourceName = referenceType.sourceName();
+            if (sourceName != null && !sourceName.isBlank()) {
+                return normalizeSourcePath(sourceName);
+            }
+        } catch (AbsentInformationException ignored) {
+        }
+        return null;
+    }
+
+    private Set<Integer> referenceTypeExecutableLines(ReferenceType referenceType) {
+        Set<Integer> lines = new TreeSet<>();
+        try {
+            for (Location location : referenceType.allLineLocations()) {
+                int line = location.lineNumber();
+                if (line > 0) {
+                    lines.add(line);
+                }
+            }
+        } catch (AbsentInformationException ignored) {
+        }
+        return lines;
+    }
+
+    private boolean referenceTypeHasMainMethod(ReferenceType referenceType) {
+        return referenceType.methodsByName("main", "([Ljava/lang/String;)V").stream()
+                .anyMatch(method -> method.isStatic() && method.isPublic());
+    }
+
     private String resolveSourcePath(long breakpointId, Location location) {
         if (breakpointId >= 0) {
             BreakpointSpec spec = breakpoints.get(breakpointId);
@@ -704,5 +892,11 @@ public final class DebuggerSession implements AutoCloseable {
             int index = normalized.lastIndexOf('/');
             return index >= 0 ? normalized.substring(index + 1) : normalized;
         }
+    }
+
+    private static final class SourceAccumulator {
+        private String className;
+        private final Set<Integer> executableLines = new TreeSet<>();
+        private boolean hasMainMethod;
     }
 }
