@@ -52,6 +52,7 @@ public final class DebuggerSession implements AutoCloseable {
     private static final String BREAKPOINT_ID = "breakpoint-id";
     private static final String AUTO_RESUME_STEP = "auto-resume-step";
     private static final String STEP_DEPTH = "step-depth";
+    private static final String[] STEP_EXCLUSION_PREFIXES = {"java.*", "javax.*", "sun.*"};
 
     private final AtomicLong breakpointIds = new AtomicLong(1);
     private final Map<Long, BreakpointSpec> breakpoints = new ConcurrentHashMap<>();
@@ -347,17 +348,7 @@ public final class DebuggerSession implements AutoCloseable {
             suppressBreakpoint(currentStop.breakpointId());
         }
 
-        clearStepRequest();
-        StepRequest request = eventRequestManager().createStepRequest(thread, StepRequest.STEP_LINE, direction.depth());
-        request.addCountFilter(1);
-        request.addClassExclusionFilter("java.*");
-        request.addClassExclusionFilter("javax.*");
-        request.addClassExclusionFilter("sun.*");
-        request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-        request.putProperty(BREAKPOINT_ID, -1L);
-        request.putProperty(STEP_DEPTH, direction.depth());
-        request.enable();
-        currentStepRequest = request;
+        createAndEnableStepRequest(thread, direction.depth(), false);
         currentVm.resume();
     }
 
@@ -469,7 +460,7 @@ public final class DebuggerSession implements AutoCloseable {
         clearStepRequest();
         pausedThread = thread;
         Long breakpointIdValue = requestBreakpointId instanceof Long value ? value : null;
-        long breakpointId = breakpointIdValue == null ? -1L : breakpointIdValue.longValue();
+        long breakpointId = breakpointIdValue == null ? -1L : breakpointIdValue;
         if (breakpointId >= 0) {
             suppressBreakpoint(breakpointId);
         }
@@ -557,8 +548,7 @@ public final class DebuggerSession implements AutoCloseable {
                 request.putProperty(BREAKPOINT_ID, spec.id());
                 request.enable();
                 activeBreakpointRequests.put(spec.id(), request);
-            } catch (AbsentInformationException ignored) {
-            } catch (DuplicateRequestException ignored) {
+            } catch (AbsentInformationException | DuplicateRequestException ignored) {
             } catch (VMDisconnectedException ignored) {
                 // Target disconnected during request creation; safe to ignore.
             }
@@ -668,19 +658,9 @@ public final class DebuggerSession implements AutoCloseable {
         }
 
         Integer depthValue = depthProperty instanceof Integer value ? value : null;
-        int depth = depthValue == null ? StepRequest.STEP_OVER : depthValue.intValue();
-        clearStepRequest();
+        int depth = depthValue == null ? StepRequest.STEP_OVER : depthValue;
         try {
-            StepRequest request = eventRequestManager().createStepRequest(thread, StepRequest.STEP_LINE, depth);
-            request.addCountFilter(1);
-            request.addClassExclusionFilter("java.*");
-            request.addClassExclusionFilter("javax.*");
-            request.addClassExclusionFilter("sun.*");
-            request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-            request.putProperty(BREAKPOINT_ID, -1L);
-            request.putProperty(STEP_DEPTH, depth);
-            request.enable();
-            currentStepRequest = request;
+            createAndEnableStepRequest(thread, depth, false);
             return true;
         } catch (RuntimeException ignored) {
             return false;
@@ -705,18 +685,26 @@ public final class DebuggerSession implements AutoCloseable {
             return;
         }
 
+        createAndEnableStepRequest(thread, StepRequest.STEP_OVER, true);
+        currentVm.resume();
+    }
+
+    private void createAndEnableStepRequest(ThreadReference thread, int depth, boolean autoResumeStep) {
         clearStepRequest();
-        StepRequest request = eventRequestManager().createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER);
+
+        StepRequest request = eventRequestManager().createStepRequest(thread, StepRequest.STEP_LINE, depth);
         request.addCountFilter(1);
-        request.addClassExclusionFilter("java.*");
-        request.addClassExclusionFilter("javax.*");
-        request.addClassExclusionFilter("sun.*");
+        for (String exclusionPrefix : STEP_EXCLUSION_PREFIXES) {
+            request.addClassExclusionFilter(exclusionPrefix);
+        }
         request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
         request.putProperty(BREAKPOINT_ID, -1L);
-        request.putProperty(AUTO_RESUME_STEP, Boolean.TRUE);
+        request.putProperty(STEP_DEPTH, depth);
+        if (autoResumeStep) {
+            request.putProperty(AUTO_RESUME_STEP, Boolean.TRUE);
+        }
         request.enable();
         currentStepRequest = request;
-        currentVm.resume();
     }
 
     private void suppressBreakpoint(long breakpointId) {

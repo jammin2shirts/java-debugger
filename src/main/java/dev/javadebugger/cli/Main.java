@@ -26,6 +26,8 @@ import dev.javadebugger.core.StepDirection;
 public final class Main {
     private static final Duration WAIT_FOR_STOP_TIMEOUT = Duration.ofMinutes(5);
     private static final BreakpointPersistence BREAKPOINT_PERSISTENCE = BreakpointPersistence.defaultStore();
+    private static final String LAUNCH_CONNECTED_MESSAGE = "Connected (launch mode). Target is suspended at startup.";
+    private static final String EXECUTION_RESUMED_MESSAGE = "Execution resumed. Waiting for next stop...";
     private static volatile List<Path> configuredSourceRoots = List.of();
     private static volatile boolean attachMode = false;
 
@@ -38,47 +40,7 @@ public final class Main {
             return;
         }
 
-        SessionPlan sessionPlan;
-        if (args.length > 0 && "launch".equals(args[0])) {
-            configuredSourceRoots = List.of();
-            attachMode = false;
-            LaunchConfig config = parseLaunchConfig(Arrays.copyOfRange(args, 1, args.length));
-            sessionPlan = new SessionPlan(
-                    session -> session.start(config),
-                    true,
-                    "Connected (launch mode). Target is suspended at startup.");
-        } else if (args.length > 0 && "attach".equals(args[0])) {
-            AttachConfig config = parseAttachConfig(Arrays.copyOfRange(args, 1, args.length));
-            List<Path> attachSourceRoots = config.sourceRoots().isEmpty()
-                ? defaultAttachSourceRoots()
-                : config.sourceRoots();
-            configuredSourceRoots = normalizeSourceRoots(attachSourceRoots);
-            attachMode = true;
-            sessionPlan = new SessionPlan(
-                    session -> session.attach(config.host(), config.port()),
-                    false,
-                attachStartupMessage(config.host(), config.port(), configuredSourceRoots));
-            } else if (containsToken(args, "--launch")) {
-                configuredSourceRoots = List.of();
-                attachMode = false;
-                LaunchConfig config = parseLaunchConfig(removeToken(args, "--launch"));
-                sessionPlan = new SessionPlan(
-                    session -> session.start(config),
-                    true,
-                    "Connected (launch mode). Target is suspended at startup.");
-        } else {
-                // Default mode: attach to localhost:5005 unless attach options override it.
-                AttachConfig config = parseAttachConfig(args);
-                List<Path> attachSourceRoots = config.sourceRoots().isEmpty()
-                    ? defaultAttachSourceRoots()
-                    : config.sourceRoots();
-                configuredSourceRoots = normalizeSourceRoots(attachSourceRoots);
-                attachMode = true;
-                sessionPlan = new SessionPlan(
-                    session -> session.attach(config.host(), config.port()),
-                    false,
-                    attachStartupMessage(config.host(), config.port(), configuredSourceRoots));
-        }
+        SessionPlan sessionPlan = buildSessionPlan(args);
 
         List<BreakpointSpec> breakpointsForRestart = BREAKPOINT_PERSISTENCE.load();
 
@@ -86,12 +48,7 @@ public final class Main {
             AtomicReference<DebuggerStop> asyncStopRef = new AtomicReference<>();
             try (DebuggerSession session = new DebuggerSession(asyncStopRef::set)) {
                 sessionPlan.start(session);
-                for (BreakpointSpec breakpoint : breakpointsForRestart) {
-                    BreakpointSpec restored = session.addBreakpoint(breakpoint.sourcePath(), breakpoint.line());
-                    if (!breakpoint.enabled()) {
-                        session.disableBreakpoint(restored.id());
-                    }
-                }
+                restoreBreakpoints(session, breakpointsForRestart);
 
                 String startupMessage;
                 if (sessionPlan.waitForInitialStop() && !breakpointsForRestart.isEmpty()) {
@@ -136,6 +93,53 @@ public final class Main {
             }
         }
         return filtered.toArray(String[]::new);
+    }
+
+    private static SessionPlan buildSessionPlan(String[] args) {
+        if (args.length > 0 && "launch".equals(args[0])) {
+            LaunchConfig config = parseLaunchConfig(Arrays.copyOfRange(args, 1, args.length));
+            return launchSessionPlan(config);
+        }
+
+        if (args.length > 0 && "attach".equals(args[0])) {
+            AttachConfig config = parseAttachConfig(Arrays.copyOfRange(args, 1, args.length));
+            return attachSessionPlan(config);
+        }
+
+        if (containsToken(args, "--launch")) {
+            LaunchConfig config = parseLaunchConfig(removeToken(args, "--launch"));
+            return launchSessionPlan(config);
+        }
+
+        // Default mode: attach to localhost:5005 unless attach options override it.
+        return attachSessionPlan(parseAttachConfig(args));
+    }
+
+    private static SessionPlan launchSessionPlan(LaunchConfig config) {
+        configuredSourceRoots = List.of();
+        attachMode = false;
+        return new SessionPlan(session -> session.start(config), true, LAUNCH_CONNECTED_MESSAGE);
+    }
+
+    private static SessionPlan attachSessionPlan(AttachConfig config) {
+        List<Path> attachSourceRoots = config.sourceRoots().isEmpty()
+                ? defaultAttachSourceRoots()
+                : config.sourceRoots();
+        configuredSourceRoots = normalizeSourceRoots(attachSourceRoots);
+        attachMode = true;
+        return new SessionPlan(
+                session -> session.attach(config.host(), config.port()),
+                false,
+                attachStartupMessage(config.host(), config.port(), configuredSourceRoots));
+    }
+
+    private static void restoreBreakpoints(DebuggerSession session, List<BreakpointSpec> breakpointsForRestart) {
+        for (BreakpointSpec breakpoint : breakpointsForRestart) {
+            BreakpointSpec restored = session.addBreakpoint(breakpoint.sourcePath(), breakpoint.line());
+            if (!breakpoint.enabled()) {
+                session.disableBreakpoint(restored.id());
+            }
+        }
     }
 
     private static ShellResult runShell(DebuggerSession session,
@@ -192,7 +196,7 @@ public final class Main {
                     }
                     session.resumeExecution();
                     lastRepeatableCommand = "continue";
-                    lastMessage = "Execution resumed. Waiting for next stop...";
+                    lastMessage = EXECUTION_RESUMED_MESSAGE;
                     if (isTerminated(session)) {
                         lastRepeatableCommand = null;
                     }

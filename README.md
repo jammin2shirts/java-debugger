@@ -1,27 +1,51 @@
-# Java Debugger
+# Java Debugger CLI
 
-Standalone Java debugger CLI built on JDI.
+Minimal interactive Java debugger built on JDI, focused on terminal workflows.
 
-## Status
+## Features
 
-This is the first implementation pass. It supports launching a JVM, setting line breakpoints, and stepping with arrow-key controls.
+- Attach to an existing JVM (`127.0.0.1:5005` by default)
+- Launch a JVM under debugger control
+- Persistent breakpoints across restarts
+- File picker and breakpoint manager TUI workflows
+- Step into, step over, step out, continue
+- Async breakpoint pickup while the prompt is idle (good for REST API traffic)
+- Source snippet rendering with fallback messages for mapped runtime-only locations
 
-## Build
+## Requirements
+
+- Java 17+
+- Maven 3.9+
+- Target app started with JDWP when using attach mode
+
+Example JDWP flags for an external app:
+
+```bash
+-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
+```
+
+## Build And Test
 
 ```bash
 mvn test
 ```
 
-## Install on macOS
+Package only:
+
+```bash
+mvn -DskipTests clean package
+```
+
+## Install On macOS
 
 ```bash
 ./scripts/install-jdbg.sh
 ```
 
-This installs:
+Installer outputs:
 
-- `jdbg` command in `/usr/local/bin` if writable, otherwise `~/.local/bin`
-- debugger jar in `~/.local/share/jdbg/java-debugger.jar`
+- `jdbg` in `/usr/local/bin` when writable, otherwise `~/.local/bin`
+- jar at `~/.local/share/jdbg/java-debugger.jar`
 
 Uninstall:
 
@@ -29,95 +53,166 @@ Uninstall:
 ./scripts/uninstall-jdbg.sh
 ```
 
-## Run
+## Command Modes
+
+### Default (Attach)
+
+Running `jdbg` with no mode flags uses attach mode:
 
 ```bash
-mvn -q -DskipTests package
-
-# default mode: attach to 127.0.0.1:5005
 jdbg
+```
 
-# attach with a different port/host
-jdbg --port 6006 --host 127.0.0.1
+Equivalent explicit form:
 
-# attach and point debugger to the target app's source tree for source snippets
-jdbg --port 5005 \
-  --source-root /absolute/path/to/other-app/src/main/java
+```bash
+jdbg attach --host 127.0.0.1 --port 5005
+```
 
-# launch a new JVM under debugger control (explicit launch mode)
+### Launch Under Debugger
+
+```bash
 jdbg --launch \
   --main-class dev.javadebugger.sample.SampleApp \
   --classpath target/test-classes:target/classes
+```
 
-# equivalent subcommand form still supported
+Equivalent subcommand form:
+
+```bash
 jdbg launch \
   --main-class dev.javadebugger.sample.SampleApp \
   --classpath target/test-classes:target/classes
-
-# in the debugger shell
-# 1) use `files` to set a breakpoint with cursor + space
-# 2) start execution
-continue
 ```
 
-Interactive commands after launch:
+## Spring Boot / REST API Workflow (Recommended)
 
-- `start` / `continue`
-- `status`
-- `breaks`
-- `clear <id>`
-- `files` (browse project files, set/remove breakpoints with cursor + space)
-- `manage` (enable/disable/delete breakpoints)
-- `state clear` (clear saved breakpoint state from disk)
-- `restart`
-- `quit`
+1. Start Spring Boot with JDWP enabled (`suspend=n` for normal service startup).
+2. Start debugger in attach mode.
+3. Use `files` to set breakpoints.
+4. Send API traffic with curl.
+5. When a breakpoint is hit, debugger stops automatically and shows context.
 
-Shortcut interface:
+Example:
 
-- `c` start/continue
-- Arrow keys at main prompt: `↑` step into, `→` step over, `←` step out, `↓` start/continue
-- `x` prompt for breakpoint id to clear
-- `f` open project file browser
-- `m` open breakpoint manager
-- `s` status
-- `l` list breakpoints
-- `r` restart current debug flow (keeps breakpoints)
-- `q` quit
-- `enter` repeats the last `continue` or `step` command
+```bash
+# Terminal 1: spring boot app with debug socket
+./mvnw spring-boot:run \
+  -Dspring-boot.run.jvmArguments='-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005'
 
-Runtime notifications:
+# Terminal 2: debugger
+jdbg --port 5005 --source-root /absolute/path/to/app/src/main/java
 
-- After `continue`, the UI reports when execution has moved past the current stop and is still running.
-- When the target process ends normally, the UI confirms completion and suggests `restart` (`r`).
-- The TUI always shows the full current breakpoint list.
-- After `restart`, the UI reports which breakpoints were restored.
+# Inside jdbg: set breakpoints (files), then resume if needed
+continue
 
-Persistent breakpoints:
+# Terminal 3: trigger endpoint
+curl -i http://localhost:8080/api/v1/orders/42
+```
 
-- Breakpoints are saved automatically between CLI runs.
-- Saved state path: `~/.java-debugger/breakpoints.dbg`.
-- Saved fields: source path, line, and enabled/disabled state.
-- Use `state clear` to remove saved breakpoint state.
+Notes:
 
-Breakpoint workflows:
+- In attach mode, debugger starts in running state and waits for runtime stops.
+- `continue` is non-blocking and returns prompt immediately.
+- Breakpoint hits are surfaced asynchronously while prompt is active.
 
-- `files`: browse source files with up/down, press enter to open a file, then use up/down and `space` to toggle a breakpoint on the highlighted line.
-- `manage`: review all breakpoints, use `space` to enable/disable selected, `d` to delete selected, `a` enable all, `n` disable all, `x` delete all.
+## Interactive Commands
 
-Attach-mode file browsing:
+- `start` or `continue`: resume execution
+- `step into|over|out`: stepping controls while paused
+- `status`: current stop summary
+- `breaks`: list breakpoints
+- `clear <id>`: remove breakpoint by id
+- `files`: browse files and toggle breakpoints
+- `manage`: enable/disable/delete breakpoints in bulk
+- `state clear`: clear persisted breakpoint state
+- `restart`: restart session and reapply saved breakpoints
+- `quit` or `exit`: leave debugger
 
-- In `attach` mode, `files` lists source files reported by the connected JVM's loaded classes (not just local workspace files).
-- The list is filtered to hide common dependency/framework packages so you can focus on app/project classes.
-- If that filtered list is empty, the picker falls back to all attached JVM source files.
-- If local source text is available, the line picker shows source lines.
-- If local source text is unavailable, the line picker shows executable line numbers from JVM debug metadata, and `space` toggles breakpoints on those lines.
-- In `attach` mode, the debugger does not auto-scan your filesystem for source roots.
-- If you run `jdbg attach` from a target project root, the debugger automatically uses `./src/main/java` and `./src/test/java` (if present) as source roots.
-- Use `--source-root` to explicitly provide source directories for the target JVM project so stop locations can render real source snippets.
+## Keyboard Shortcuts
 
-CLI mode defaults:
+- `↓`: continue
+- `↑`: step into
+- `→`: step over
+- `←`: step out
+- `f`: open file picker
+- `m`: open breakpoint manager
+- `x`: prompt for breakpoint id to clear
+- `s`: status
+- `l`: list breakpoints
+- `r`: restart
+- `q`: quit
+- Enter on empty prompt: repeat previous continue/step command
 
-- Running `jdbg` with no mode flags uses `attach` mode by default.
-- Default attach target is `127.0.0.1:5005`.
-- Override attach connection with `--host` and `--port`.
-- Use `--launch` (or `launch`) to switch to launch-under-debugger mode.
+## Source Rendering Behavior
+
+- While running: source pane shows unavailable/running status.
+- On regular source line stops: current line marker is shown with nearby lines.
+- On runtime mapped lines without local text (common method epilogue/closing brace mappings):
+  - debugger prints explicit mapped-location messaging so users know stepping did happen.
+
+## Breakpoint Persistence
+
+- Persisted automatically in `~/.java-debugger/breakpoints.dbg`
+- Stored fields: source path, line, enabled state
+- Removed with `state clear`
+
+## Attach-Mode Source Roots
+
+- No broad filesystem scanning is performed in attach mode.
+- If running `jdbg attach` from project root, defaults include:
+  - `./src/main/java`
+  - `./src/test/java`
+- Use one or more explicit roots when debugging an external app:
+
+```bash
+jdbg attach \
+  --host 127.0.0.1 \
+  --port 5005 \
+  --source-root /path/to/app/src/main/java \
+  --source-root /path/to/app/src/test/java
+```
+
+## Troubleshooting
+
+### jdbg runs old code
+
+Reinstall to rebuild and refresh launcher artifact:
+
+```bash
+./scripts/install-jdbg.sh
+hash -r
+```
+
+### I pressed step before first stop
+
+Expected behavior: CLI reminds you debugger is running and not paused yet.
+
+### Step over near method end pauses again
+
+Expected in Java debug metadata. Method epilogue can map to another stoppable location before termination. Use `continue` to finish immediately.
+
+## Local Developer Examples
+
+### Debug the sample test app
+
+```bash
+mvn -DskipTests clean package
+jdbg --launch \
+  --main-class dev.javadebugger.sample.SampleApp \
+  --classpath target/test-classes:target/classes
+```
+
+### Attach to non-default port
+
+```bash
+jdbg --host 127.0.0.1 --port 6006
+```
+
+### Attach with external source roots only
+
+```bash
+jdbg attach \
+  --port 5005 \
+  --source-root /workspace/orders-service/src/main/java
+```
