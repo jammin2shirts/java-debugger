@@ -28,6 +28,15 @@ public final class Main {
     private static final BreakpointPersistence BREAKPOINT_PERSISTENCE = BreakpointPersistence.defaultStore();
     private static final String LAUNCH_CONNECTED_MESSAGE = "Connected (launch mode). Target is suspended at startup.";
     private static final String EXECUTION_RESUMED_MESSAGE = "Execution resumed. Waiting for next stop...";
+    private static final int SOURCE_CONTEXT_LINES = 4;
+    private static final int SOURCE_TRAILING_FALLBACK_LINES = 6;
+    private static final String ANSI_RESET = "\033[0m";
+    private static final String ANSI_BOLD = "\033[1m";
+    private static final String ANSI_DIM = "\033[2m";
+    private static final String ANSI_CYAN = "\033[36m";
+    private static final String ANSI_GREEN = "\033[32m";
+    private static final String ANSI_YELLOW = "\033[33m";
+    private static final String ANSI_RED = "\033[31m";
     private static volatile List<Path> configuredSourceRoots = List.of();
     private static volatile boolean attachMode = false;
 
@@ -309,29 +318,30 @@ public final class Main {
 
     private static void renderInterface(DebuggerSession session, String message) {
         clearScreen();
-        System.out.println("Java Debugger (TUI)");
-        System.out.println("===================");
-        System.out.println("Status: " + describeCurrentStop(session.currentStop()));
-        if (message != null && !message.isBlank()) {
-            System.out.println("Message: " + message);
-        }
+        Optional<DebuggerStop> currentStop = session.currentStop();
+        printSectionHeader("JAVA DEBUGGER", "live debug view");
+        System.out.println(formatStatusLine(currentStop));
         System.out.println();
+        printSectionHeader("BREAKPOINTS", null);
         renderBreakpointsPane(session.breakpointList());
         System.out.println();
-        renderSourcePane(session.currentStop());
+        printSectionHeader("SOURCE", "current execution context");
+        renderSourcePane(currentStop);
+        System.out.println();
+        printSectionHeader("ACTIVITY", "latest debugger message");
+        renderActivityPane(message);
         System.out.println();
         printCommandBar();
     }
 
     private static void renderBreakpointsPane(List<BreakpointSpec> breakpoints) {
-        System.out.println("Breakpoints:");
         if (breakpoints.isEmpty()) {
-            System.out.println("  <none>");
+            System.out.println("  " + muted("<none>"));
             return;
         }
 
         for (BreakpointSpec breakpoint : breakpoints) {
-            String enabled = breakpoint.enabled() ? "enabled" : "disabled";
+            String enabled = breakpoint.enabled() ? color("enabled", ANSI_GREEN) : color("disabled", ANSI_YELLOW);
             System.out.println("  " + breakpoint.id() + " [" + enabled + "] -> " + breakpoint.sourcePath() + ":" + breakpoint.line());
         }
     }
@@ -342,7 +352,72 @@ public final class Main {
     }
 
     private static void printCommandBar() {
-        System.out.println("Commands: [↓] start/continue  [↑] step into  [→] step over  [←] step out  [x] clear  [f] files  [m] manage breakpoints  [s] status  [l] breaks  [r] restart  [state clear] clear saved  [h] help  [q] quit  [enter] repeat");
+        printSectionHeader("COMMANDS", null);
+        System.out.println("  [↓] start/continue  [↑] step into  [→] step over  [←] step out");
+        System.out.println("  [x] clear  [f] files  [m] manage breakpoints  [s] status  [l] breaks");
+        System.out.println("  [r] restart  [state clear] clear saved  [h] help  [q] quit  [enter] repeat");
+    }
+
+    private static String formatStatusLine(Optional<DebuggerStop> currentStop) {
+        String label;
+        String color;
+        if (currentStop.isEmpty()) {
+            label = "RUNNING";
+            color = ANSI_CYAN;
+        } else if (currentStop.get().terminated()) {
+            label = "TERMINATED";
+            color = ANSI_RED;
+        } else {
+            label = "PAUSED";
+            color = ANSI_GREEN;
+        }
+
+        return "Status: " + color("[" + label + "]", ANSI_BOLD, color) + " " + describeCurrentStop(currentStop);
+    }
+
+    private static void renderActivityPane(String message) {
+        if (message == null || message.isBlank()) {
+            System.out.println("  " + muted("No recent activity."));
+            return;
+        }
+
+        String prefix = messageContainsWarning(message) ? color("!", ANSI_BOLD, ANSI_YELLOW) : color("i", ANSI_BOLD, ANSI_CYAN);
+        System.out.println("  " + prefix + " " + message);
+    }
+
+    private static boolean messageContainsWarning(String message) {
+        String text = message.toLowerCase(Locale.ROOT);
+        return text.contains("unknown")
+                || text.contains("invalid")
+                || text.contains("not paused")
+                || text.contains("cannot")
+                || text.contains("interrupted")
+                || text.contains("terminated");
+    }
+
+    private static void printSectionHeader(String title, String subtitle) {
+        String heading = color("=== " + title + " ===", ANSI_BOLD, ANSI_CYAN);
+        System.out.println(heading);
+        if (subtitle != null && !subtitle.isBlank()) {
+            System.out.println(muted("  " + subtitle));
+        }
+    }
+
+    private static String muted(String text) {
+        return color(text, ANSI_DIM);
+    }
+
+    private static String color(String text, String... codes) {
+        if (System.console() == null || text == null || text.isEmpty()) {
+            return text;
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (String code : codes) {
+            builder.append(code);
+        }
+        builder.append(text).append(ANSI_RESET);
+        return builder.toString();
     }
 
     private static String expandInput(String rawInput, Scanner scanner) {
@@ -1106,13 +1181,13 @@ public final class Main {
 
     private static void renderSourcePane(Optional<DebuggerStop> stop) {
         if (stop.isEmpty()) {
-            System.out.println("Source: <unavailable while running>");
+            System.out.println("Source: " + muted("<unavailable while running>"));
             return;
         }
 
         DebuggerStop current = stop.get();
         if (current.terminated() || "start".equals(current.kind()) || current.lineNumber() <= 0) {
-            System.out.println("Source: <no current source line>");
+            System.out.println("Source: " + muted("<no current source line>"));
             return;
         }
 
@@ -1149,7 +1224,7 @@ public final class Main {
         }
 
         if (currentLine > lines.size()) {
-            int startLine = Math.max(1, lines.size() - 2);
+            int startLine = Math.max(1, lines.size() - SOURCE_TRAILING_FALLBACK_LINES + 1);
             int endLine = lines.size();
             int gutterWidth = Integer.toString(currentLine).length();
 
@@ -1162,8 +1237,8 @@ public final class Main {
             return;
         }
 
-        int startLine = Math.max(1, currentLine - 2);
-        int endLine = Math.min(lines.size(), currentLine + 2);
+        int startLine = Math.max(1, currentLine - SOURCE_CONTEXT_LINES);
+        int endLine = Math.min(lines.size(), currentLine + SOURCE_CONTEXT_LINES);
         int gutterWidth = Integer.toString(endLine).length();
 
         System.out.println("Source: " + sourceFile.get() + ":" + currentLine);
