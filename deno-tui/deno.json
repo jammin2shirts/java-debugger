@@ -1,0 +1,7 @@
+{
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "start": "deno run -A src/main.ts",
+    "bench": "deno run -A src/main.ts bench"
+  }
+}

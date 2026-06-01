@@ -85,6 +85,49 @@ jdbg launch \
   --classpath target/test-classes:target/classes
 ```
 
+## Deno TUI (Java Engine + JS Front-End)
+
+This repository now includes a Deno-based colorful TUI in `deno-tui/` that drives the same Java JDI debugger engine through a lightweight bridge process.
+
+### Why this exists
+
+- Test whether Java debugging is practical from a JS runtime UI
+- Keep JDI logic in Java, while experimenting with richer terminal UX in Deno
+- Measure bridge overhead independently with a benchmark command
+
+### Requirements
+
+- Deno 2.x+
+- Java 17+
+- Maven 3.9+
+
+### Run in attach mode
+
+```bash
+cd deno-tui
+deno task start attach --host 127.0.0.1 --port 5005 --source-root /absolute/path/to/src/main/java
+```
+
+### Run in launch mode
+
+```bash
+cd deno-tui
+deno task start launch \
+  --main-class dev.javadebugger.sample.SampleApp \
+  --classpath ../target/test-classes:../target/classes
+```
+
+### Measure Deno<->Java bridge overhead
+
+```bash
+cd deno-tui
+deno task bench
+```
+
+This benchmark measures protocol round-trip latency (ping) between Deno and the Java bridge, which helps estimate UI-layer overhead separate from JVM debug event cost.
+
+In the Deno TUI, `files` opens an interactive picker: use the arrow keys to choose a file, then use the arrow keys and Enter to toggle breakpoints on executable lines directly from the selected file view.
+
 ## Spring Boot / REST API Workflow (Recommended)
 
 1. Start Spring Boot with JDWP enabled (`suspend=n` for normal service startup).

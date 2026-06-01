@@ -62,6 +62,8 @@ public final class DebuggerSession implements AutoCloseable {
     private final BlockingQueue<DebuggerStop> stopQueue = new LinkedBlockingQueue<>();
     private final CountDownLatch terminationLatch = new CountDownLatch(1);
     private final Consumer<DebuggerStop> stopConsumer;
+    private final OutputStream processStdoutSink;
+    private final OutputStream processStderrSink;
 
     private volatile VirtualMachine vm;
     private volatile ThreadReference pausedThread;
@@ -71,8 +73,16 @@ public final class DebuggerSession implements AutoCloseable {
     private volatile boolean autoResumeOnVmStart;
 
     public DebuggerSession(Consumer<DebuggerStop> stopConsumer) {
+        this(stopConsumer, System.out, System.err);
+    }
+
+    public DebuggerSession(Consumer<DebuggerStop> stopConsumer,
+                           OutputStream processStdoutSink,
+                           OutputStream processStderrSink) {
         this.stopConsumer = stopConsumer == null ? stop -> {
         } : stopConsumer;
+        this.processStdoutSink = processStdoutSink;
+        this.processStderrSink = processStderrSink;
     }
 
     public synchronized void start(LaunchConfig config) throws IOException, IllegalConnectorArgumentsException, VMStartException {
@@ -92,8 +102,8 @@ public final class DebuggerSession implements AutoCloseable {
         }
 
         vm = connector.launch(arguments);
-        pumpProcessStream(vm.process().getInputStream(), System.out);
-        pumpProcessStream(vm.process().getErrorStream(), System.err);
+        pumpProcessStream(vm.process().getInputStream(), processStdoutSink);
+        pumpProcessStream(vm.process().getErrorStream(), processStderrSink);
         EventRequestManager requestManager = vm.eventRequestManager();
         ClassPrepareRequest classPrepareRequest = requestManager.createClassPrepareRequest();
         classPrepareRequest.setSuspendPolicy(EventRequest.SUSPEND_NONE);
@@ -856,6 +866,18 @@ public final class DebuggerSession implements AutoCloseable {
     }
 
     private void pumpProcessStream(InputStream inputStream, OutputStream outputStream) {
+        if (outputStream == null) {
+            Thread thread = new Thread(() -> {
+                try (InputStream in = inputStream) {
+                    in.transferTo(OutputStream.nullOutputStream());
+                } catch (IOException ignored) {
+                }
+            }, "jdbg-process-stream");
+            thread.setDaemon(true);
+            thread.start();
+            return;
+        }
+
         Thread thread = new Thread(() -> {
             try (InputStream in = inputStream) {
                 in.transferTo(outputStream);
