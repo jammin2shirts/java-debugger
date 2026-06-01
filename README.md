@@ -2,6 +2,8 @@
 
 Minimal interactive Java debugger built on JDI, focused on terminal workflows.
 
+For a consolidated Java CLI + JS Ink CLI feature baseline used by LLM contributors, see [docs/feature-baseline.md](docs/feature-baseline.md).
+
 ## Features
 
 - Attach to an existing JVM (`127.0.0.1:5005` by default)
@@ -87,7 +89,7 @@ jdbg launch \
 
 ## Deno TUI (Java Engine + JS Front-End)
 
-This repository now includes a Deno-based colorful TUI in `deno-tui/` that drives the same Java JDI debugger engine through a lightweight bridge process.
+This repository now includes a Deno-based Ink TUI in `deno-tui/` that drives the same Java JDI debugger engine through a lightweight bridge process.
 
 ### Why this exists
 
